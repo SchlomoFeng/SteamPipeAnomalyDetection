@@ -112,11 +112,18 @@ features:
     val: 3 # 15 -> 18
     test: 3 # 18 -> 21
   split_col_name: "split"
+
+
+# Model and training hyperparameters
+model_params:
+  window_size: 24      # Sliding window size for timeseries samples
+  stride: 1            # Step size for sliding window
+  top_k_components: 3  # Number of top components for root cause attribution
 ```
 
 ---
 
-###### ### **第一阶段：数据预处理与特征工程 (`src/build_features.py`)**
+### **第一阶段：数据预处理与特征工程 (`src/build_features.py`)**
 
 **任务:** 创建一个**可配置的、可复现的、健壮的、内存高效的**脚本，将原始数据转化为一组干净、必要的特征文件。此脚本将负责构建图的静态结构，并提取静态与动态的节点和边特征。
 
@@ -141,9 +148,10 @@ features:
   - **输入:** `config`, `node_df`, `edge_df`。
   - **数据校验:** 确保`edge_df`中的`source_id`和`target_id`都存在于`node_df`的`node_index`列中。若不存在，则抛出带有明确错误信息的`ValueError`。
   - **创建节点映射:** 创建`node_map.json`，内容为从`node_index`到全局连续整数ID的映射。
+  - **创建边映射:** 创建一个`link_map.json`。为`edge_df`中的每一条边（可以用行索引或一个唯一的边标识符）创建一个到全局连续整数ID的映射。
   - **创建全局邻接关系:** 使用`node_map`将`edge_df`中的`source_id`和`target_id`转换为全局整数ID，生成`edge_index_dict`。将其保存为`data/processed/adjacency_global.pkl`。
   - **创建元数据:** 根据`node_df`中的节点类型和`edge_df`中的连接关系，创建并保存`metadata.pkl`。格式为 `(['NodeType1', ...], [('SrcType', 'to', 'DstType'), ...])`。
-  - **返回:** `node_map`。
+  - **返回:** `node_map`，`link_map`。
 3. **静态边特征提取 (`create_static_edge_features`):**
   
   - **输入:** `config`, `edge_df`。
@@ -236,11 +244,13 @@ features:
 
 - 实现`SteamNet_Autoencoder`类 (`torch.nn.Module`)。
 - **`__init__`中 (关键指令):**
-  - 构造函数的参数应包括模型超参数以及从`metadata.pkl`中加载的`metadata`元组。
-  - **核心架构:** **必须**使用 `torch_geometric.nn.HeteroConv` 来构建GNN层，内部使用`GATv2Conv`。
-  - **`GRU`层:** 为所有节点类型定义`GRU`网络。
-  - **解码器:** 定义用于重构的MLP解码头。
+  - 构造函数的参数应包括模型超参数以及从`metadata.pkl`中加载的`metadata`元组，以及**边特征的维度`edge_features_dim`**。
+  - **核心架构:** **必须**使用 `torch_geometric.nn.HeteroConv` 来构建GNN层，内部使用`GATv2Conv`，在初始化时**必须**传入`edge_dim=edge_features_dim`参数，以使其能够处理边特征。
   - **无数据节点嵌入层:** 为所有`no_data_nodes`中的节点类型，分别创建一个`torch.nn.Embedding`层。这个嵌入层将作为这些节点在没有任何输入特征时的初始表示。
+  - **`GRU`层:** 为所有节点类型定义`GRU`网络。
+  - **解码器:**
+    - **节点解码器:** 为每个**有数据**的节点类型（`data_nodes`）定义用于重构节点特征的MLP解码头。
+    - **边解码器:** 为每种**有动态特征**的边类型定义用于重构边特征的MLP解码头。
 - **`forward(data: HeteroData)`方法 (并行化指令):**
   - **核心逻辑:** `forward`方法必须**避免使用Python `for`循环**来遍历时间维度，而是要利用PyG和PyTorch的并行计算能力。
   - **实现步骤:**
@@ -324,22 +334,27 @@ features:
 3. **模型推理与误差计算:**
   
   - 实现`run_inference(model, data_loader)`函数。
-  - **核心指令:** 此函数**不能**只返回一个全局误差。它必须计算并返回**每个组件（节点/边）在每个时间步的重构误差**。
+  - **核心指令:** 此函数必须计算并返回**每个节点和每条边**在每个时间步的重构误差。
   - **返回结构示例:** 一个字典，包含：
-    - `global_errors`: 每个时间步的全局平均重构误差 `(num_samples,)`。
-    - `component_errors`: 一个嵌套字典，存储每个组件的误差，如 `{'Stream': (num_samples, num_stream_nodes), 'Tee': ...}`。
+    - `global_node_errors`: 每个时间步的全局平均**节点**重构误差 `(num_samples,)`。
+    - `global_edge_errors`: 每个时间步的全局平均**边**重构误差 `(num_samples,)`。
+    - ``node_errors`: 一个嵌套字典，存储每个节点的误差，如 `{'Stream': (num_samples, num_stream_nodes)}`。
+    - `edge_errors`: 一个嵌套字典，存储每个边的误差，如 `{('Stream', 'to', 'Stream'): (num_samples, num_s_to_s_edges)}`。
     - `true_labels`: 每个时间步的真实标签 `(num_samples,)`。
 4. **阈值确定与根因归因:**
   
   - **a. 确定事件检测阈值:**
-    - 在验证集 (`split='val'`) 上运行推理，得到`global_errors`。
-    - 根据验证集上的全局误差分布，选择一个合适的阈值（例如，99分位数），用于判断一个时间点是否为异常事件。
+    - 在验证集 (`split='val'`) 上运行推理，得到`global_node_errors`和`global_edge_errors`。
+    - 将两者加权组合成一个总误差，或以`global_node_errors`为主，来确定一个合适的事件检测阈值。
   - **b. 根因归因分析 (关键步骤):**
+    - 在测试集 (`split='test'`) 上运行推理。
+    - 遍历测试集的每个真实异常时间步 `t` (`true_labels[t] == 1`)。
     - 初始化一个空列表`all_components_errors`。
-    - 遍历`component_errors`字典中的每个节点类型`ntype`和对应的误差张量`errors_tensor`。
-    - 遍历`errors_tensor`中的每个组件索引`local_idx`，将其在时间步`t`的误差值，连同其身份信息 `(ntype, local_idx)`，作为一个元组 `(error, (ntype, local_idx))` 添加到`all_components_errors`列表中。
-    - 对`all_components_errors`列表按`error`进行降序排序。
-    - 选取列表的前K个元素，这样就得到了全局Top-K组件的误差及其准确的类型和局部ID。
+    - **遍历节点误差:** 从`node_errors`中，将每个节点在时间`t`的误差及其身份 `('node', ntype, local_idx)` 添加到列表中。
+    - **遍历边误差:** 从`edge_errors`中，将每条边在时间`t`的误差及其身份 `('edge', etype, local_idx)` 添加到列表中。
+    - 对`all_components_errors`列表按误差值进行降序排序。
+    - 选取列表的前K个元素，得到全局Top-K异常组件（可能是节点或边）。
+    - **记录结果:** 在记录时，**必须**使用从实验目录加载的`node_map.json`或`link_map.json`的反向映射，将组件的整数ID转换回其原始ID，以便结果具有可解释性。
 5. **性能评估:**
   
   - **a. 事件检测性能评估:**
@@ -354,15 +369,16 @@ features:
     - 将上述所有评估指标和分析结果保存到`reports/evaluation_summary.csv`。
 6. **结果可视化:**
   
-  - **核心指令:** 生成`reports/figures/anomaly_event_example.png`，用于直观展示模型的定位能力。
+  - **核心指令:** 生成`reports/figures/anomaly_event_example.png`，用于直观展示模型的定位能力，**必须同时包含节点和边的信息**。
   - **实现步骤:**
     1. 从测试集中选择一个具有代表性的真实异常事件（`true_labels == 1`）。
     2. 绘制一张时序图，横轴为时间。
     3. 图中应包含以下几条曲线：
-      - 该事件窗口内，**全局平均重构误差**的变化曲线。
-      - 该事件中，被归因为**Top-3高误差组件**各自的重构误差变化曲线。
-      - 使用不同的颜色和图例清晰地区分这些曲线。
-    4. 图表应能清晰地展示：在异常发生时，特定几个组件的误差显著、同步地飙升，远高于全局平均水平。
+      - 全局平均**节点**重构误差曲线。
+      - 全局平均**边**重构误差曲线。
+      - 该事件中，被归因为**Top-K高误差的组件**（无论是节点还是边）各自的重构误差变化曲线。
+      - 使用不同的颜色、线型和图例清晰地区分这些曲线。
+    4. 图表应能清晰地展示：在异常发生时，特定几个组件（尤其是高误差的边）的误差显著飙升。[]()
 7. **主函数:**
   
   - 在`if __name__ == "__main__":`中，解析命令行参数以获取实验目录路径，然后按顺序调用以上函数，完成整个评估流程。
