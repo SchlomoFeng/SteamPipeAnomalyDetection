@@ -172,7 +172,7 @@ features:
   - **d. 创建动态节点特征:**
     - **整合特征:** 对每个节点，在每个时间步上，构建一个特征向量，其组成为：归一化后的动态特征、数据掩码、状态向量（如有）。
     - 将所有节点的完整时序特征整合，并保存为`data/processed/timeseries_node_features.parquet`。
-  - **e. 创建动态边特征 (化工工艺细化):**
+  - **e. 创建动态边特征 (化工工艺细化):****实现提示：** 为了高效计算动态边特征，请先将时序数据`merged_df`通过`df.pivot()`或`df.set_index()`操作，转换成一个以`timestamp`为索引、`node_index`为列、压力/温度值为值的“宽”格式DataFrame。这样，在任何时间步`t`，都可以直接从该行中获取所有节点的压力，从而极大地简化和加速边特征的计算，避免在循环中进行昂贵的查找操作。”
     - 对于每个时间步，基于节点状态计算以下边特征：
       1. **`Mode_Indicator` (One-Hot):** `[is_flowing, is_standby]`。
       2. **`Specific_Pressure_Drop` (数值):** `(P_source - P_target) / (Length + ε)`。
@@ -224,7 +224,7 @@ features:
         2. **填充节点特征:** 从时序特征数据中切片出当前窗口的节点特征，填充到`sample[node_type].x`。
         3. **填充边索引:** 将**步骤c**中创建的**`edge_index_dict_local`** 赋给`sample`。由于图结构是静态的，所有样本共享同一套局部边索引。
         4. **填充边特征:** 如果有动态边特征，切片出当前窗口的特征并填充。
-        5. **填充标签:** 存储当前窗口的真实标签`sample.y`。
+        5. **填充样本标签:** 一个时间窗口可能包含多个时间点的标签。**聚合规则：** 只要窗口内至少存在一个`1`（真实异常），则该窗口的样本标签 `sample.y` 就被记为`1`；否则为`0`。最终`sample.y`应该是一个标量（scalar）。
         6. 将创建好的`sample`对象添加到一个`data_list`中。
     - **e. 保存处理结果:**
       - 对每个数据集（train/val/test），在循环结束后，调用`torch.save(self.collate(data_list), self.processed_paths[i])`，将所有样本高效地序列化到一个文件中。
@@ -240,24 +240,33 @@ features:
   - **核心架构:** **必须**使用 `torch_geometric.nn.HeteroConv` 来构建GNN层，内部使用`GATv2Conv`。
   - **`GRU`层:** 为所有节点类型定义`GRU`网络。
   - **解码器:** 定义用于重构的MLP解码头。
+  - **无数据节点嵌入层:** 为所有`no_data_nodes`中的节点类型，分别创建一个`torch.nn.Embedding`层。这个嵌入层将作为这些节点在没有任何输入特征时的初始表示。
 - **`forward(data: HeteroData)`方法 (并行化指令):**
   - **核心逻辑:** `forward`方法必须**避免使用Python `for`循环**来遍历时间维度，而是要利用PyG和PyTorch的并行计算能力。
   - **实现步骤:**
-    1. **获取输入:** `x_dict`和`edge_attr_dict`（如果存在）从输入的`data`对象中获取。此时的节点特征张量形状应为 `(num_nodes, window_size, in_features)`。
-    2. **GNN层并行处理:**
+    1. **准备节点表示:** ...对于`no_data_nodes`中的每个节点类型，将其（从0开始的）局部索引作为输入，通过对应的`Embedding`层获取其初始特征表示`x`。将这些表示与有时序数据的节点（`data_nodes`）的特征一同整合进`x_dict`。
+      
+    2. **获取输入:** `x_dict`和`edge_attr_dict`（如果存在）从输入的`data`对象中获取。此时的节点特征张量形状应为 `(num_nodes, window_size, in_features)`。
+      
+    3. **GNN层并行处理:**
+      
       - 直接将包含时间维度的`x_dict`和`edge_attr_dict`送入`self.conv1` (`HeteroConv`层)。
       - PyG将在底层高效地并行完成所有`window_size`个时间步的图卷积计算。
       - GNN层的输出 `spatial_embeddings` 将是一个字典，其value是形状为 `(num_nodes, window_size, hidden_dim)` 的张量。
-    3. **应用激活和Dropout。**
-    4. **通过GRU层:**
+    4. **应用激活和Dropout。**
+      
+    5. **通过GRU层:**
+      
       - 将上一步得到的`spatial_embeddings`字典，直接按节点类型分别送入对应的`GRU`网络。
       - `GRU`层会正确处理`window_size`这个序列维度。
       - **必须**使用`GRU`返回的第一个值`output`，它包含了**每个时间步**的隐状态，形状为`(num_nodes, window_size, gru_hidden_dim)`。将其命名为`latent_sequences`。
-    5. **序列化解码 (Sequence-wise Decoding):**
+    6. **序列化解码 (Sequence-wise Decoding):**
+      
       - 将`latent_sequences`字典送入各自的解码器MLP头。
       - 解码器MLP必须作用于序列的最后一个维度，以确保在`window_size`的每个时间步上都独立地进行解码。
       - 最终输出一个与输入`x_dict`形状相似的重构序列字典 `reconstructed_sequences`。
-    6. **返回重构结果** `reconstructed_sequences`。
+    7. **返回重构结果** `reconstructed_sequences`。
+      
 
 **3. `src/train.py`:**
 
@@ -326,13 +335,11 @@ features:
     - 在验证集 (`split='val'`) 上运行推理，得到`global_errors`。
     - 根据验证集上的全局误差分布，选择一个合适的阈值（例如，99分位数），用于判断一个时间点是否为异常事件。
   - **b. 根因归因分析 (关键步骤):**
-    - 在测试集 (`split='test'`) 上运行推理。
-    - 遍历测试集的每个时间步 `t`：
-      - 使用上一步确定的阈值，判断当前时间步是否为模型预测的异常 (`predicted_label=1`)。
-      - 如果 `true_labels[t] == 1` (真实异常事件)：
-        - 从`component_errors`中提取当前时间步 `t` 所有组件的误差。
-        - 对误差进行排序，找出**误差最高的Top-K个组件**（例如K=3）。
-        - **记录结果:** 在记录这些组件时，**必须**使用从实验目录加载的`node_map.json`的反向映射，将组件的整数ID转换回其原始的`node_index`，以便结果具有可解释性。记录下这些原始ID及其误差值。
+    - 初始化一个空列表`all_components_errors`。
+    - 遍历`component_errors`字典中的每个节点类型`ntype`和对应的误差张量`errors_tensor`。
+    - 遍历`errors_tensor`中的每个组件索引`local_idx`，将其在时间步`t`的误差值，连同其身份信息 `(ntype, local_idx)`，作为一个元组 `(error, (ntype, local_idx))` 添加到`all_components_errors`列表中。
+    - 对`all_components_errors`列表按`error`进行降序排序。
+    - 选取列表的前K个元素，这样就得到了全局Top-K组件的误差及其准确的类型和局部ID。
 5. **性能评估:**
   
   - **a. 事件检测性能评估:**
