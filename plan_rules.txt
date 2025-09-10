@@ -1,0 +1,373 @@
+### **AI Agent 项目构建指令 (Master Prompt)**
+
+**你好！我需要你作为我的AI开发伙伴，根据以下详细的项目蓝图，使用Python构建一个完整的“基于异构图神经网络的化工蒸汽管网异常检测系统”。请严格遵循每个阶段的指令、文件名、函数签名和技术栈要求。**
+**请务必逐个阶段地构建此项目，在一个阶段未完成时不得进行下一阶段的内容。如果有任何问题，请务务必随时向我提问。**
+
+#### **项目概览**
+
+- **项目名称:** `SteamPipeAnomalyDetection`
+- **核心目标:** 利用PyTorch和PyTorch Geometric (PyG)，构建并离线评估一个异构时序图自编码器模型，用于检测工业蒸汽管网中的异常事件。
+- **技术栈:** Python 3.9+, PyYAML, PyTorch, PyTorch Geometric (PyG), Pandas, NumPy, Scikit-learn, Joblib, PyArrow, Matplotlib, Seaborn, openpyxl。
+
+#### **项目文件结构**
+
+```
+SteamPipeAnomalyDetection/
+├── config.yml                     # 项目配置文件
+├── data/
+│   ├── raw/
+│   │   ├── 蓬莱蒸汽_S40.xlsx         # [唯一拓扑源] 节点、边、类型、属性
+│   │   └── labeled/                   # [时序数据源] 存放已标注数据的文件夹
+│   │       ├── 节点名称1.csv
+│   │       └── ...
+│   └── processed/                   # [流水线输出] 只包含以下必要文件
+│       ├── adjacency_global.pkl       # 包含全局索引的边
+│       ├── metadata.pkl               # 描述图结构的元数据
+│       ├── node_map.json              # 从唯一的node_index到全局整数索引的映射
+│       ├── link_map.json
+│       ├── static_feature_scaler.joblib
+│       ├── dynamic_feature_scaler.joblib
+│       ├── static_edge_features.parquet
+│       └── timeseries_node_features.parquet
+├── models/
+│   └── steamnet_20250910_022339/      # 采用带时间戳的、不可变的实验目录
+│       ├── model.pt
+│       ├── hparams.json
+│       ├── config.yml                 # 本次实验的配置快照
+│       ├── metadata.pkl
+│       ├── node_map.json
+│       ├── link_map.json
+│       ├── static_feature_scaler.joblib
+│       └── dynamic_feature_scaler.joblib
+├── reports/
+│   ├── evaluation_summary.csv
+│   └── figures/
+│       └── anomaly_event_example.png
+├── src/
+│   ├── __init__.py
+│   ├── build_features.py
+│   ├── dataset.py
+│   ├── model.py
+│   ├── train.py
+│   └── evaluate.py
+└── requirements.txt
+```
+
+#### **配置文件 (`config.yml`)**
+
+**任务:** 在项目根目录创建`config.yml`文件。所有脚本中的硬编码参数都**必须**从此文件读取。
+
+```yaml
+# Project-level settings
+project:
+  model_version: "steamnet"
+  random_seed: 42
+
+# Data paths and file names
+data:
+  raw_path: "data/raw"
+  processed_path: "data/processed"
+  models_path: "models"
+  topology_filename: "蓬莱蒸汽_S40.xlsx"
+  labeled_data_folder: "labeled"
+
+# Topology configuration
+topology:
+  node_sheet: "node_info"
+  edge_sheet: "edge_info"
+  # 使用 'node_index' 作为唯一标识符，防止 'name' 重名问题
+  node_unique_id_col: "node_index"
+  node_type_col: "type"
+  node_name_col: "name"
+  # 边的端点ID列，其值应对应 node_info 中的 node_index
+  edge_source_col: "source_id"
+  edge_target_col: "target_id"
+  static_edge_features:
+    - "Length"
+
+# Node types
+node_types:
+  # 有时序数据的节点类型
+  data_nodes:
+    - "Stream"
+  # 无时序数据的节点类型（其重构损失将被忽略）
+  no_data_nodes:
+    - "Tee"
+    - "Mixer"
+    - "VavlePro"
+
+# Timeseries data configuration
+timeseries:
+  timestamp_col: "timestamp"
+  label_col: "Label"
+  feature_cols:
+    - "Pressure"
+    - "Mass_Flow"
+    - "Temperature"
+
+# Feature engineering configuration
+features:
+  split_days:
+    train: 15
+    val: 3 # 15 -> 18
+    test: 3 # 18 -> 21
+  split_col_name: "split"
+```
+
+---
+
+###### ### **第一阶段：数据预处理与特征工程 (`src/build_features.py`)**
+
+**任务:** 创建一个**可配置的、可复现的、健壮的、内存高效的**脚本，将原始数据转化为一组干净、必要的特征文件。此脚本将负责构建图的静态结构，并提取静态与动态的节点和边特征。
+
+**核心要求:**
+
+- **配置驱动:** 脚本**严禁**包含任何硬编码参数。所有值都**必须**从`config.yml`加载。
+- **唯一ID:** **必须**使用`config.topology.node_unique_id_col`（即`node_index`）作为节点的唯一标识符进行所有映射和关联，以避免`name`列重名可能导致的错误。
+- **可复现性:** 脚本的任何随机过程都**必须**由`config.yml`中的`random_seed`控制。
+- **数据校验:** 在处理数据前，**必须**执行严格的数据校验。
+- **数据防泄漏:** 在进行特征归一化时，定标器（scaler）**必须**仅在训练集上`fit`，然后对验证集和测试集进行`transform`。
+- **内存效率:** 避免一次性将所有时序数据加载到内存中。应采用**惰性加载**或**逐文件处理**的策略。
+
+**请在`src/build_features.py`中实现以下功能:**
+
+1. **全局设置与加载:**
+  
+  - 定义并调用`set_seed`函数以确保可复现性。
+  - 实现一个`load_config`函数，加载`config.yml`。
+  - 在主函数流程开始时，仅加载**拓扑相关的Excel文件** (`蓬莱蒸汽_S40.xlsx`) 到Pandas DataFrame中。
+2. **静态图结构构建 (`build_static_graph`):**
+  
+  - **输入:** `config`, `node_df`, `edge_df`。
+  - **数据校验:** 确保`edge_df`中的`source_id`和`target_id`都存在于`node_df`的`node_index`列中。若不存在，则抛出带有明确错误信息的`ValueError`。
+  - **创建节点映射:** 创建`node_map.json`，内容为从`node_index`到全局连续整数ID的映射。
+  - **创建全局邻接关系:** 使用`node_map`将`edge_df`中的`source_id`和`target_id`转换为全局整数ID，生成`edge_index_dict`。将其保存为`data/processed/adjacency_global.pkl`。
+  - **创建元数据:** 根据`node_df`中的节点类型和`edge_df`中的连接关系，创建并保存`metadata.pkl`。格式为 `(['NodeType1', ...], [('SrcType', 'to', 'DstType'), ...])`。
+  - **返回:** `node_map`。
+3. **静态边特征提取 (`create_static_edge_features`):**
+  
+  - **输入:** `config`, `edge_df`。
+  - 从`edge_df`中提取`config.topology.static_edge_features`定义的静态特征（例如`Length`）。
+  - **归一化:** 初始化一个`MinMaxScaler`。**注意：** 对静态特征的归一化也应被视为一种“训练”过程。在理想的在线部署场景中，此定标器不应在新数据上重新`fit`。在当前离线项目中，我们可以在所有已知静态边特征上进行`fit_transform`。
+  - **保存:**
+    - 将归一化后的特征保存为`data/processed/static_edge_features.parquet`。
+    - 使用`joblib`将训练好的定标器保存为`data/processed/static_feature_scaler.joblib`。
+4. **时序数据处理与动态特征工程 (`create_dynamic_features`):**
+  
+  - **输入:** `config`, `node_df`, `edge_df`, `node_map`。
+  - **实现策略:** 此函数应**内部管理时序数据的加载**，而不是接收一个巨大的数据字典。
+  - **a. 准备数据加载:**
+    - 创建一个`node_index`到`name`的映射，用于定位CSV文件。
+    - 遍历`config.node_types.data_nodes`中的节点类型，获取所有需要处理的`node_index`列表。
+  - **b. 逐文件处理与数据集划分:**
+    - **循环加载:** 遍历上述`node_index`列表，在循环内部**逐个加载**对应的时序数据CSV文件。
+    - 对加载的单个DataFrame，根据`config.features.split_days`中定义的天数，添加一个`split`列，标记为`train`, `val`, 或 `test`。
+    - 将处理后的DataFrame（包含`split`列）暂存到一个列表中。
+    - 循环结束后，将列表中的所有DataFrame合并为一个大的`merged_df`。
+  - **c. 动态特征归一化 (防泄漏):**
+    - 初始化一个新的`MinMaxScaler`。
+    - **仅在** `merged_df` 的训练集部分 (`split='train'`) 上对`config.timeseries.feature_cols`定义的特征列进行`fit`。
+    - 使用这个训练好的定标器，对整个`merged_df`（train, val, test）进行`transform`。
+    - 使用`joblib`将此定标器保存为`data/processed/dynamic_feature_scaler.joblib`。
+  - **d. 创建动态节点特征:**
+    - **整合特征:** 对每个节点，在每个时间步上，构建一个特征向量，其组成为：归一化后的动态特征、数据掩码、状态向量（如有）。
+    - 将所有节点的完整时序特征整合，并保存为`data/processed/timeseries_node_features.parquet`。
+  - **e. 创建动态边特征 (化工工艺细化):**
+    - 对于每个时间步，基于节点状态计算以下边特征：
+      1. **`Mode_Indicator` (One-Hot):** `[is_flowing, is_standby]`。
+      2. **`Specific_Pressure_Drop` (数值):** `(P_source - P_target) / (Length + ε)`。
+      3. **`Specific_Temperature_Drop` (数值):** `(T_source - T_target) / (Length + ε)`。
+      4. **`Reverse_Pressure_Gradient` (二元):** 如果 `P_target > P_source` 且 `is_flowing=1`，则为1，否则为0。
+      5. **`Node_Mass_Balance_Residual` (数值):**
+        - 对于每一个'Mixer'或'Tee'节点，在每个时间步上，计算其质量平衡残差。
+        - **流向判断规则:** **必须**基于该时间步上**压降的方向**（`P_source` vs `P_target`）来判断每条相连边的流向，而不是依赖其流量值的正负号或固定的拓扑方向。高压侧为流入端，低压侧为流出端。
+        - **计算公式:** `(ΣFlow_in - ΣFlow_out) / (max(ΣFlow_in, ΣFlow_out) + ε)`。
+        - 将计算出的残差值赋给**所有**与该'Mixer'或'Tee'节点相连的边作为它们在该时间步的特征之一。
+    - **整合与保存:** 将所有计算出的动态边特征整合，保存为`data/processed/timeseries_edge_features.parquet`。
+5. **主函数 (`main`):**
+  
+  - 在`if __name__ == "__main__":`中定义`main`函数。
+  - **执行流程:**
+    1. 加载配置 (`config.yml`)。
+    2. 设置随机种子。
+    3. 加载拓扑数据 (`蓬莱蒸汽_S40.xlsx`) 到`node_df`和`edge_df`。
+    4. 调用 `build_static_graph`，传入`config, node_df, edge_df`。
+    5. 调用 `create_static_edge_features`，传入`config, edge_df`。
+    6. 调用 `create_dynamic_features`，传入`config, node_df, edge_df, node_map`。
+    7. 打印日志，确认所有文件已成功生成到`data/processed/`目录。
+
+---
+
+### **第二阶段：模型开发与训练 (`src/dataset.py`, `src/model.py`, `src/train.py`)**
+
+**1. `src/dataset.py` :**
+
+- **核心要求:** **必须**继承 `torch_geometric.data.InMemoryDataset` 以实现高效的数据处理。避免在 `__getitem__` 中执行任何昂贵的计算。
+  
+- **实现`SteamNetDataset`类:**
+  
+  - **`__init__`方法:**
+    - 调用 `super().__init__(root, transform, pre_transform)`。
+    - 加载并存储处理好的数据集文件。
+  - **`processed_file_names`属性:**
+    - 返回一个字符串列表，例如 `['train_data.pt', 'val_data.pt', 'test_data.pt']`，用于标识处理后的数据文件。
+  - **`process()`方法 (核心预处理逻辑):**
+    - 此方法是执行所有昂贵、一次性预处理的地方。
+    - **a. 加载原始数据:** 加载在第一阶段生成的所有`data/processed/`下的文件（`adjacency_global.pkl`, `node_map.json`, 时序特征等）。
+    - **b. 创建全局到局部的索引映射:** 在此方法内部，创建从全局节点索引到各类型内部局部索引的完整映射。
+    - **c. 创建局部边索引字典:** 使用上述映射，将全局的`adjacency_global.pkl`内容转换为一个使用**局部索引**的`edge_index_dict_local`。此操作**仅执行一次**。
+    - **d. 准备时序滑窗样本:**
+      - 加载`timeseries_node_features.parquet`等时序数据。
+      - 根据`split`列划分数据集。
+      - 对每个数据集（train/val/test），使用**滑窗法**生成样本。对于每个时间窗口：
+        1. 创建一个新的`HeteroData`对象：`sample = HeteroData()`。
+        2. **填充节点特征:** 从时序特征数据中切片出当前窗口的节点特征，填充到`sample[node_type].x`。
+        3. **填充边索引:** 将**步骤c**中创建的**`edge_index_dict_local`** 赋给`sample`。由于图结构是静态的，所有样本共享同一套局部边索引。
+        4. **填充边特征:** 如果有动态边特征，切片出当前窗口的特征并填充。
+        5. **填充标签:** 存储当前窗口的真实标签`sample.y`。
+        6. 将创建好的`sample`对象添加到一个`data_list`中。
+    - **e. 保存处理结果:**
+      - 对每个数据集（train/val/test），在循环结束后，调用`torch.save(self.collate(data_list), self.processed_paths[i])`，将所有样本高效地序列化到一个文件中。
+  - **`__getitem__(idx)`方法 :**
+    - 此方法必须极其高效。
+    - 直接返回 `self.get(idx)`，或者如果需要额外处理，则从`self.data`中获取并返回第`idx`个样本。
+
+**2. `src/model.py` :**
+
+- 实现`SteamNet_Autoencoder`类 (`torch.nn.Module`)。
+- **`__init__`中 (关键指令):**
+  - 构造函数的参数应包括模型超参数以及从`metadata.pkl`中加载的`metadata`元组。
+  - **核心架构:** **必须**使用 `torch_geometric.nn.HeteroConv` 来构建GNN层，内部使用`GATv2Conv`。
+  - **`GRU`层:** 为所有节点类型定义`GRU`网络。
+  - **解码器:** 定义用于重构的MLP解码头。
+- **`forward(data: HeteroData)`方法 (并行化指令):**
+  - **核心逻辑:** `forward`方法必须**避免使用Python `for`循环**来遍历时间维度，而是要利用PyG和PyTorch的并行计算能力。
+  - **实现步骤:**
+    1. **获取输入:** `x_dict`和`edge_attr_dict`（如果存在）从输入的`data`对象中获取。此时的节点特征张量形状应为 `(num_nodes, window_size, in_features)`。
+    2. **GNN层并行处理:**
+      - 直接将包含时间维度的`x_dict`和`edge_attr_dict`送入`self.conv1` (`HeteroConv`层)。
+      - PyG将在底层高效地并行完成所有`window_size`个时间步的图卷积计算。
+      - GNN层的输出 `spatial_embeddings` 将是一个字典，其value是形状为 `(num_nodes, window_size, hidden_dim)` 的张量。
+    3. **应用激活和Dropout。**
+    4. **通过GRU层:**
+      - 将上一步得到的`spatial_embeddings`字典，直接按节点类型分别送入对应的`GRU`网络。
+      - `GRU`层会正确处理`window_size`这个序列维度。
+      - **必须**使用`GRU`返回的第一个值`output`，它包含了**每个时间步**的隐状态，形状为`(num_nodes, window_size, gru_hidden_dim)`。将其命名为`latent_sequences`。
+    5. **序列化解码 (Sequence-wise Decoding):**
+      - 将`latent_sequences`字典送入各自的解码器MLP头。
+      - 解码器MLP必须作用于序列的最后一个维度，以确保在`window_size`的每个时间步上都独立地进行解码。
+      - 最终输出一个与输入`x_dict`形状相似的重构序列字典 `reconstructed_sequences`。
+    6. **返回重构结果** `reconstructed_sequences`。
+
+**3. `src/train.py`:**
+
+- **核心要求:**
+  - **完全可复现:** 使用`set_seed`控制所有随机性。
+  - **实验即版本:** 每次运行都创建带时间戳的唯一实验目录（例如 `models/steamnet_20250910_053325`），并保存配置快照和所有工件。
+- **实现细节:**
+  1. **定义Masked Loss (关键步骤):**
+    - 在脚本中实现一个名为 `MaskedMSELoss` 的自定义损失函数。
+    - **函数签名:** `def MaskedMSELoss(reconstructed_dict, original_dict, nodes_to_ignore)`
+    - **实现逻辑:**
+      1. 该函数接收模型输出的重构字典、原始输入字典以及一个需要忽略其损失的节点类型列表（即`config.node_types.no_data_nodes`）。
+      2. 初始化总损失`total_loss = 0`和计数器`count = 0`。
+      3. 遍历`original_dict`中的每个节点类型 (`node_type`) 和对应的原始特征张量 `original_x`。
+      4. **进行判断:** `if node_type in nodes_to_ignore:`，则`continue`，跳过此节点类型。
+      5. 如果需要计算损失，则从`reconstructed_dict`中取出对应的`reconstructed_x`。
+      6. 计算`original_x`和`reconstructed_x`之间的`MSELoss`。
+      7. 将此损失累加到`total_loss`中，并将`count`加一。
+      8. **返回平均损失:** `return total_loss / count if count > 0 else torch.tensor(0.0)`。
+  2. **训练循环:**
+    - 在每个训练步骤中，从`DataLoader`获取一个`batch`对象。
+    - 调用模型得到`reconstructed_x_dict = model(batch)`。
+    - 从`config`中获取`no_data_nodes`列表。
+    - **调用自定义损失函数计算损失:** `loss = MaskedMSELoss(reconstructed_x_dict, batch.x_dict, config.node_types.no_data_nodes)`。
+  3. **主函数逻辑:**
+    - 加载配置，设置随机种子。
+    - 创建唯一的、带当前时间戳 (`20250910_053325`) 的实验目录。
+    - 实例化`SteamNetDataset`和`DataLoader`。
+    - 执行训练和验证循环。
+    - 将最佳模型及所有相关工件（`hparams.json`, `config.yml`副本, 映射文件, 定标器等）保存到本次运行的唯一实验目录中。
+
+---
+
+### ### Copilot said: 好的，SchlomoFeng。 我们已经走到了最后一步。基于我们对架构一致性和工程实践的严格审查，我现在为您呈现经过最终修正的**第三阶段完整提示词**。 这个版本修复了之前版本中所有关键的逻辑缺陷。它明确了如何正确、安全地从自包含的实验目录中加载模型，并纠正了数据加载流程，使其与第二阶段的`InMemoryDataset`架构完全兼容。最重要的是，它清晰地指明了在评估流程的**正确环节**（即结果解释阶段）使用映射表和定标器，确保了整个项目的端到端逻辑自洽。 这是您可以直接使用的、健壮且无懈可击的最终阶段指令。 --- ### **第三阶段：离线测试 (`src/evaluate.py`)** **任务:** 将一个**指定版本**的、已封装的模型在`split='test'`的数据上进行评估。此阶段的核心是**在只有事件级标签（系统是否异常）而无根因级标签（哪个管道泄漏）的情况下，验证模型定位异常根源的能力**。我们将通过分析组件级的重构误差来实现这一目标。 **请在`src/evaluate.py`中实现以下功能:** 1. **加载模型与工件 (自包含加载):**
+
+好的，SchlomoFeng。
+
+我们已经走到了最后一步。基于我们对架构一致性和工程实践的严格审查，我现在为您呈现经过最终修正的**第三阶段完整提示词**。
+
+这个版本修复了之前版本中所有关键的逻辑缺陷。它明确了如何正确、安全地从自包含的实验目录中加载模型，并纠正了数据加载流程，使其与第二阶段的`InMemoryDataset`架构完全兼容。最重要的是，它清晰地指明了在评估流程的**正确环节**（即结果解释阶段）使用映射表和定标器，确保了整个项目的端到端逻辑自洽。
+
+这是您可以直接使用的、健壮且无懈可击的最终阶段指令。
+
+---
+
+### **第三阶段：离线测试 (`src/evaluate.py`)**
+
+**任务:** 将一个**指定版本**的、已封装的模型在`split='test'`的数据上进行评估。此阶段的核心是**在只有事件级标签（系统是否异常）而无根因级标签（哪个管道泄漏）的情况下，验证模型定位异常根源的能力**。我们将通过分析组件级的重构误差来实现这一目标。
+
+**请在`src/evaluate.py`中实现以下功能:**
+
+1. **加载模型与工件 (自包含加载):**
+  
+  - 此脚本应接收一个**唯一的实验目录路径**作为命令行参数，例如 `models/steamnet_20250910_053826/`。
+  - **所有加载操作必须限定在该目录内完成。**
+  - 实现一个`load_model_from_dir(experiment_dir)`函数，该函数执行以下操作：
+    1. 从 `os.path.join(experiment_dir, 'hparams.json')` 加载超参数。
+    2. 从 `os.path.join(experiment_dir, 'metadata.pkl')` 加载`metadata`。
+    3. 使用加载的超参数和`metadata`实例化模型。
+    4. 从 `os.path.join(experiment_dir, 'model.pt')` 加载`state_dict`到模型中。
+    5. 加载 `experiment_dir/` 下的所有其他工件（`node_map.json`, `dynamic_feature_scaler.joblib`等）以备后用。
+    6. 返回实例化的模型和所有加载的工件。
+2. **准备测试数据:**
+  
+  - 实例化 `SteamNetDataset(split='test')` 和 `DataLoader` 来加载已在第二阶段**完全预处理好**的测试数据集。
+  - **关键指令:** 此阶段不涉及任何新的数据转换、归一化或使用外部映射表/定标器来处理输入数据。数据加载应该是直接、高效的。
+3. **模型推理与误差计算:**
+  
+  - 实现`run_inference(model, data_loader)`函数。
+  - **核心指令:** 此函数**不能**只返回一个全局误差。它必须计算并返回**每个组件（节点/边）在每个时间步的重构误差**。
+  - **返回结构示例:** 一个字典，包含：
+    - `global_errors`: 每个时间步的全局平均重构误差 `(num_samples,)`。
+    - `component_errors`: 一个嵌套字典，存储每个组件的误差，如 `{'Stream': (num_samples, num_stream_nodes), 'Tee': ...}`。
+    - `true_labels`: 每个时间步的真实标签 `(num_samples,)`。
+4. **阈值确定与根因归因:**
+  
+  - **a. 确定事件检测阈值:**
+    - 在验证集 (`split='val'`) 上运行推理，得到`global_errors`。
+    - 根据验证集上的全局误差分布，选择一个合适的阈值（例如，99分位数），用于判断一个时间点是否为异常事件。
+  - **b. 根因归因分析 (关键步骤):**
+    - 在测试集 (`split='test'`) 上运行推理。
+    - 遍历测试集的每个时间步 `t`：
+      - 使用上一步确定的阈值，判断当前时间步是否为模型预测的异常 (`predicted_label=1`)。
+      - 如果 `true_labels[t] == 1` (真实异常事件)：
+        - 从`component_errors`中提取当前时间步 `t` 所有组件的误差。
+        - 对误差进行排序，找出**误差最高的Top-K个组件**（例如K=3）。
+        - **记录结果:** 在记录这些组件时，**必须**使用从实验目录加载的`node_map.json`的反向映射，将组件的整数ID转换回其原始的`node_index`，以便结果具有可解释性。记录下这些原始ID及其误差值。
+5. **性能评估:**
+  
+  - **a. 事件检测性能评估:**
+    - 使用测试集上的`global_errors`和事件检测阈值，生成预测标签。
+    - 将预测标签与`true_labels`（0 vs 1）进行比较，计算并记录`F1-score`, `Precision`, `Recall`。
+  - **b. 定位结果分析:**
+    - 创建一个数据框，记录所有`true_labels == 1`的事件。
+    - 对于每个真实异常事件，列出模型归因的Top-K组件（使用其原始`node_index`）及其误差。
+    - **（可选）误差值还原:** 在报告误差值时，可以考虑使用从实验目录加载的`dynamic_feature_scaler.joblib`的`inverse_transform`方法，将误差值从归一化尺度还原到其原始物理尺度，以增强报告的工程价值。
+    - 分析在所有真实异常事件中，哪些组件被最频繁地识别为高误差源。
+  - **c. 结果汇总:**
+    - 将上述所有评估指标和分析结果保存到`reports/evaluation_summary.csv`。
+6. **结果可视化:**
+  
+  - **核心指令:** 生成`reports/figures/anomaly_event_example.png`，用于直观展示模型的定位能力。
+  - **实现步骤:**
+    1. 从测试集中选择一个具有代表性的真实异常事件（`true_labels == 1`）。
+    2. 绘制一张时序图，横轴为时间。
+    3. 图中应包含以下几条曲线：
+      - 该事件窗口内，**全局平均重构误差**的变化曲线。
+      - 该事件中，被归因为**Top-3高误差组件**各自的重构误差变化曲线。
+      - 使用不同的颜色和图例清晰地区分这些曲线。
+    4. 图表应能清晰地展示：在异常发生时，特定几个组件的误差显著、同步地飙升，远高于全局平均水平。
+7. **主函数:**
+  
+  - 在`if __name__ == "__main__":`中，解析命令行参数以获取实验目录路径，然后按顺序调用以上函数，完成整个评估流程。
