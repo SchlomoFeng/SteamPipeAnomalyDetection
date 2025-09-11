@@ -1,7 +1,7 @@
 ### **AI Agent 项目构建指令 (Master Prompt)**
 
 **你好！我需要你作为我的AI开发伙伴，根据以下详细的项目蓝图，使用Python构建一个完整的“基于异构图神经网络的化工蒸汽管网异常检测系统”。请严格遵循每个阶段的指令、文件名、函数签名和技术栈要求。**
-**请务必逐个阶段地构建此项目，在一个阶段未完成时不得进行下一阶段的内容。如果有任何问题，请务务必随时向我提问。**
+**请务必逐个阶段地构建此项目，在一个阶段未完成时不得进行下一阶段的内容。如果有任何问题，请务必随时向我提问。**
 
 #### **项目概览**
 
@@ -123,7 +123,7 @@ model_params:
 
 ---
 
-### **第一阶段：数据预处理与特征工程 (`src/build_features.py`)**
+### **第一阶段：数据预处理与特征工程 (`src/build_features.py`)**
 
 **任务:** 创建一个**可配置的、可复现的、健壮的、内存高效的**脚本，将原始数据转化为一组干净、必要的特征文件。此脚本将负责构建图的静态结构，并提取静态与动态的节点和边特征。
 
@@ -243,17 +243,20 @@ model_params:
 **2. `src/model.py` :**
 
 - 实现`SteamNet_Autoencoder`类 (`torch.nn.Module`)。
+  
 - **`__init__`中 (关键指令):**
+  
   - 构造函数的参数应包括模型超参数以及从`metadata.pkl`中加载的`metadata`元组，以及**边特征的维度`edge_features_dim`**。
-  - **核心架构:** **必须**使用 `torch_geometric.nn.HeteroConv` 来构建GNN层，内部使用`GATv2Conv`，在初始化时**必须**传入`edge_dim=edge_features_dim`参数，以使其能够处理边特征。
+  - **核心架构:** **必须**使用 `torch_geometric.nn.HeteroConv` 来构建GNN层，内部使用`GATv2Conv`。
   - **无数据节点嵌入层:** 为所有`no_data_nodes`中的节点类型，分别创建一个`torch.nn.Embedding`层。这个嵌入层将作为这些节点在没有任何输入特征时的初始表示。
   - **`GRU`层:** 为所有节点类型定义`GRU`网络。
-  - **解码器:**
-    - **节点解码器:** 为每个**有数据**的节点类型（`data_nodes`）定义用于重构节点特征的MLP解码头。
-    - **边解码器:** 为每种**有动态特征**的边类型定义用于重构边特征的MLP解码头。
+  - **解码器:** **节点解码器:** 为每个**有数据**的节点类型（`data_nodes`）定义用于重构节点特征的MLP解码头。**模型不应包含任何边解码器。**
 - **`forward(data: HeteroData)`方法 (并行化指令):**
+  
   - **核心逻辑:** `forward`方法必须**避免使用Python `for`循环**来遍历时间维度，而是要利用PyG和PyTorch的并行计算能力。
+    
   - **实现步骤:**
+    
     1. **准备节点表示:** ...对于`no_data_nodes`中的每个节点类型，将其（从0开始的）局部索引作为输入，通过对应的`Embedding`层获取其初始特征表示`x`。将这些表示与有时序数据的节点（`data_nodes`）的特征一同整合进`x_dict`。
       
     2. **获取输入:** `x_dict`和`edge_attr_dict`（如果存在）从输入的`data`对象中获取。此时的节点特征张量形状应为 `(num_nodes, window_size, in_features)`。
@@ -272,7 +275,7 @@ model_params:
       - **必须**使用`GRU`返回的第一个值`output`，它包含了**每个时间步**的隐状态，形状为`(num_nodes, window_size, gru_hidden_dim)`。将其命名为`latent_sequences`。
     6. **序列化解码 (Sequence-wise Decoding):**
       
-      - 将`latent_sequences`字典送入各自的解码器MLP头。
+      - 将`latent_sequences`字典送入各自的**节点解码器**。
       - 解码器MLP必须作用于序列的最后一个维度，以确保在`window_size`的每个时间步上都独立地进行解码。
       - 最终输出一个与输入`x_dict`形状相似的重构序列字典 `reconstructed_sequences`。
     7. **返回重构结果** `reconstructed_sequences`。
@@ -337,24 +340,27 @@ model_params:
   - **核心指令:** 此函数必须计算并返回**每个节点和每条边**在每个时间步的重构误差。
   - **返回结构示例:** 一个字典，包含：
     - `global_node_errors`: 每个时间步的全局平均**节点**重构误差 `(num_samples,)`。
-    - `global_edge_errors`: 每个时间步的全局平均**边**重构误差 `(num_samples,)`。
     - ``node_errors`: 一个嵌套字典，存储每个节点的误差，如 `{'Stream': (num_samples, num_stream_nodes)}`。
-    - `edge_errors`: 一个嵌套字典，存储每个边的误差，如 `{('Stream', 'to', 'Stream'): (num_samples, num_s_to_s_edges)}`。
     - `true_labels`: 每个时间步的真实标签 `(num_samples,)`。
 4. **阈值确定与根因归因:**
   
-  - **a. 确定事件检测阈值:**
-    - 在验证集 (`split='val'`) 上运行推理，得到`global_node_errors`和`global_edge_errors`。
-    - 将两者加权组合成一个总误差，或以`global_node_errors`为主，来确定一个合适的事件检测阈值。
+  - **a. 确定节点检测阈值:**
+    - 在验证集 (`split='val'`) 上运行推理，得到`node_errors`。
+    - 基于所有`data_nodes`在所有时间步的误差分布，选择一个合适的**节点级**异常阈值（例如，99.5分位数）。
   - **b. 根因归因分析 (关键步骤):**
-    - 在测试集 (`split='test'`) 上运行推理。
-    - 遍历测试集的每个真实异常时间步 `t` (`true_labels[t] == 1`)。
-    - 初始化一个空列表`all_components_errors`。
-    - **遍历节点误差:** 从`node_errors`中，将每个节点在时间`t`的误差及其身份 `('node', ntype, local_idx)` 添加到列表中。
-    - **遍历边误差:** 从`edge_errors`中，将每条边在时间`t`的误差及其身份 `('edge', etype, local_idx)` 添加到列表中。
-    - 对`all_components_errors`列表按误差值进行降序排序。
-    - 选取列表的前K个元素，得到全局Top-K异常组件（可能是节点或边）。
-    - **记录结果:** 在记录时，**必须**使用从实验目录加载的`node_map.json`或`link_map.json`的反向映射，将组件的整数ID转换回其原始ID，以便结果具有可解释性。
+    - 在测试集 (`split='test'`) 上运行推理，得到`node_errors`。
+    - **实现流程:**
+      - 遍历测试集的每个真实异常时间步 `t` (`true_labels[t] == 1`)。
+      - **计算边的推断误差 (Inferred Edge Error):**
+        - 初始化一个空的边误差列表 `inferred_edge_errors`。
+        - 遍历图中的每一条边 `e`（连接节点`u`和`v`）。
+        - 从`node_errors`中获取节点`u`和`v`在时间`t`的重构误差 `error_u` 和 `error_v`。
+        - **定义边的推断误差:** `error_edge = f(error_u, error_v)`。这里的函数`f`可以是一个简单的**平均值** `(error_u + error_v) / 2`，或**几何平均值** `sqrt(error_u * error_v)`，或**最小值** `min(error_u, error_v)`，以捕捉“两个端点同时异常”的信号。**指令：请使用平均值法。**
+        - 将 `(error_edge, edge_id)` 添加到`inferred_edge_errors`列表中。
+      - **排序与定位:**
+        - 对`inferred_edge_errors`列表按误差值进行降序排序。
+        - 选取列表的前K个元素，这就得到了**基于节点误差推断出的Top-K异常边**。
+      - **记录结果:** 使用`link_map.json`将边的ID转换回其原始ID进行记录。
 5. **性能评估:**
   
   - **a. 事件检测性能评估:**
